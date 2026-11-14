@@ -269,7 +269,6 @@ struct RoutedDevice {
   // on an unplug) once its transfers are back, and the taker gets it when all have let go.
   bool taking{false};
   uint32_t taking_ms{0};
-  bool retiring{false};
   std::vector<USBClient *> leaving{};
 };
 
@@ -393,7 +392,6 @@ class USBClient : public Component {
   USBClient(uint16_t vid, uint16_t pid) : trq_in_use_(0), vid_(vid), pid_(pid) {}
   void setup() override;
   void loop() override;
-  bool teardown() override;
   float get_setup_priority() const override { return setup_priority::IO; }
   virtual void on_removed(usb_device_handle_t handle);
   void dump_config() override;
@@ -648,7 +646,6 @@ class USBClient : public Component {
   /// Returns false, with no completion to follow, when the interface has no string or the
   /// read could not be started.
   bool read_interface_string_(uint8_t interface_number);
-  bool read_interface_string_(usb_device_handle_t device, uint8_t interface_number);
   /// The string read_interface_string_() asked for, or null when the read failed. It lives
   /// in the transfer buffer only until the next read, so copy what is needed.
   virtual void on_interface_string(uint8_t interface_number, const usb_str_desc_t *desc) {}
@@ -812,8 +809,6 @@ class USBHost final : public Component {
   // nothing to reset.
   void stream_release(IsocStream &stream, USBClient *cb, usb_host_client_handle_t client_handle,
                       usb_device_handle_t device_handle);
-  void stream_reset_alt(IsocStream &stream, USBClient *cb);
-  void stream_finish_close(IsocStream &stream, USBClient *client);
 
   // Static trampoline stored as xfer->callback for every ISOC URB.
   // Iterates isoc_packet_desc[], calls client->on_isoc_packet() per packet, resubmits.
@@ -824,8 +819,6 @@ class USBHost final : public Component {
   // Every driver registers in its setup(). USBHost opens each new device once, reads its
   // descriptors and hands it, interface by interface, to the drivers that match it.
   void register_client(USBClient *client);
-  bool retire_client(USBClient *client);
-  void forget_declined(USBClient *client);
 #ifdef USE_USB_HOST_SHARED_TASK
   bool attach_client(USBClient *client);
   void release_client(USBClient *client);
