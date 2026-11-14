@@ -333,6 +333,11 @@ void USBClient::setup() {
   // bulk packets where one on the full-speed controller sees 64, and both run at the same
   // time from this same code. The pool is allocated in handle_open_state_() once the
   // descriptors say what this device needs, and released again in disconnect().
+  if (usb_host_transfer_alloc(STRING_TRANSFER_SIZE, 0, &this->string_transfer_) != ESP_OK) {
+    this->mark_failed(LOG_STR("Transfer alloc failed"));
+    return;
+  }
+  this->string_transfer_->context = this;
 #ifndef USE_USB_HOST_SHARED_TASK
   xTaskCreatePinnedToCore(usb_task_fn, "usb_task", USB_TASK_STACK_SIZE, this, USB_TASK_PRIORITY,
                           &this->usb_task_handle_, LOOP_TASK_CORE);
@@ -453,7 +458,7 @@ bool USBClient::process_usb_events_() {
       if (desc != nullptr && descriptor_string_equals(desc, this->interface_filter_))
         this->interface_matched_ = true;
       this->handle_get_desc_state_();
-    } else if (this->state_ == USB_CLIENT_CONNECTED || this->accepts_more_devices_()) {
+    } else if (this->state_ == USB_CLIENT_CONNECTED) {
       this->on_interface_string(this->string_interface_, this->string_result_());
     }
   }
@@ -574,14 +579,10 @@ void USBClient::finish_open_() {
 }
 
 bool USBClient::read_interface_string_(uint8_t interface_number) {
-  return this->read_interface_string_(this->device_handle_, interface_number);
-}
-
-bool USBClient::read_interface_string_(usb_device_handle_t device, uint8_t interface_number) {
   const usb_config_desc_t *config_desc;
   const usb_device_desc_t *device_desc;
-  if (usb_host_get_active_config_descriptor(device, &config_desc) != ESP_OK ||
-      usb_host_get_device_descriptor(device, &device_desc) != ESP_OK) {
+  if (usb_host_get_active_config_descriptor(this->device_handle_, &config_desc) != ESP_OK ||
+      usb_host_get_device_descriptor(this->device_handle_, &device_desc) != ESP_OK) {
     ESP_LOGW(TAG, "Descriptor query failed");
     return false;
   }
@@ -589,15 +590,10 @@ bool USBClient::read_interface_string_(usb_device_handle_t device, uint8_t inter
   const usb_intf_desc_t *intf = usb_parse_interface_descriptor(config_desc, interface_number, 0, &offset);
   if (intf == nullptr || intf->iInterface == 0)
     return false;
-  if (this->string_transfer_ == nullptr) {
-    if (usb_host_transfer_alloc(STRING_TRANSFER_SIZE, 0, &this->string_transfer_) != ESP_OK)
-      return false;
-    this->string_transfer_->context = this;
-  }
   usb_transfer_t *xfer = this->string_transfer_;
   USB_SETUP_PACKET_INIT_GET_STR_DESC(reinterpret_cast<usb_setup_packet_t *>(xfer->data_buffer), intf->iInterface,
                                      STRING_DESC_LANGID, STRING_DESC_MAX_SIZE);
-  xfer->device_handle = device;
+  xfer->device_handle = this->device_handle_;
   xfer->bEndpointAddress = USB_DIR_IN;
   // The data stage is read in whole packets, as the host stack's own descriptor reads are
   xfer->num_bytes = SETUP_PACKET_SIZE + usb_round_up_to_mps(STRING_DESC_MAX_SIZE, device_desc->bMaxPacketSize0);
@@ -807,35 +803,6 @@ void USBClient::bind_(uint8_t addr, uint32_t interfaces) {
   this->routed_interfaces_ = interfaces;
   this->state_ = USB_CLIENT_OPEN;
   this->enable_loop();
-}
-
-bool USBClient::teardown() {
-  if (registration_hook == nullptr || this->host_ == nullptr)
-    return true;
-  this->process_usb_events_();
-  if (!this->host_->retire_client(this))
-    return false;
-  this->host_->forget_declined(this);
-#ifdef USE_USB_HOST_SHARED_TASK
-  if (!this->registered_)
-    return true;
-  this->release_if_idle_();
-  const uint8_t release = this->release_.load(std::memory_order_acquire);
-  if (release == RELEASE_FAILED)
-    this->release_.store(RELEASE_NONE, std::memory_order_release);
-  if (release != RELEASE_DONE)
-    return false;
-  this->registered_ = false;
-  this->release_.store(RELEASE_NONE, std::memory_order_release);
-#else
-  if (this->usb_task_handle_ != nullptr) {
-    vTaskDelete(this->usb_task_handle_);
-    this->usb_task_handle_ = nullptr;
-    usb_host_client_deregister(this->handle_);
-    this->handle_ = nullptr;
-  }
-#endif
-  return true;
 }
 
 void USBClient::on_removed(usb_device_handle_t handle) {
