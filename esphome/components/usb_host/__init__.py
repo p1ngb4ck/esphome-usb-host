@@ -16,6 +16,7 @@ from esphome.components.esp32 import (
     get_esp32_variant,
     idf_version,
     only_on_variant,
+    set_idf_sdkconfig_default,
 )
 import esphome.config_validation as cv
 from esphome.const import CONF_DATA, CONF_DEVICES, CONF_ID, CONF_VALUE
@@ -39,6 +40,7 @@ DOMAIN = "usb_host"
 CONF_VID = "vid"
 CONF_PID = "pid"
 CONF_PRODUCT = "product"
+CONF_INTERFACE_DESCRIPTION = "interface_description"
 CONF_ENABLE_HUBS = "enable_hubs"
 CONF_MAX_TRANSFER_REQUESTS = "max_transfer_requests"
 CONF_MAX_PACKET_SIZE = "max_packet_size"
@@ -56,6 +58,8 @@ _PERIPHERAL_MAPS = {
 }
 CONF_FS_PINS = "fs_pins"
 CONF_FULL_SPEED_ONLY = "full_speed_only"
+CONF_ISOCHRONOUS = "isochronous"
+CONF_FS_FIFO_BIAS = "full_speed_fifo_bias"
 CONF_MODE_SWITCH = "mode_switch"
 CONF_HID2HCI = "hid2hci"
 CONF_BULK_MESSAGES = "bulk_messages"
@@ -101,12 +105,13 @@ _TRANSFER_DEFINES = {
 }
 
 
-# VID/PID set to 0 or `None` product/manufacturer are wildcards
+# VID/PID set to 0 or `None` strings are wildcards
 _FILTER_WILDCARDS = {
     CONF_VID: 0,
     CONF_PID: 0,
     CONF_MANUFACTURER: None,
     CONF_PRODUCT: None,
+    CONF_INTERFACE_DESCRIPTION: None,
 }
 
 
@@ -191,11 +196,16 @@ def note_usb_whitelist_used() -> None:
 @coroutine_with_priority(CoroPriority.FINAL)
 async def _usb_match_guards() -> None:
     data = CORE.data.get(DOMAIN, {})
-    cg.add_define("USB_HOST_WHITELIST", 1 if data.get(KEY_WHITELIST_USED) else 0)
-    cg.add_define("USB_HOST_BLACKLIST", 1 if data.get(KEY_BLACKLIST_USED) else 0)
+    packaged = "package_manager" in CORE.config
+    cg.add_define(
+        "USB_HOST_WHITELIST", 1 if packaged or data.get(KEY_WHITELIST_USED) else 0
+    )
+    cg.add_define(
+        "USB_HOST_BLACKLIST", 1 if packaged or data.get(KEY_BLACKLIST_USED) else 0
+    )
     cg.add_define(
         "USB_HOST_INTERFACE_BLACKLIST",
-        1 if data.get(KEY_INTERFACE_BLACKLIST_USED) else 0,
+        1 if packaged or data.get(KEY_INTERFACE_BLACKLIST_USED) else 0,
     )
 
 
@@ -223,6 +233,7 @@ def usb_device_schema(
             cv.Optional(CONF_MANUFACTURER): cv.string_strict,
             cv.Optional(CONF_PRODUCT): cv.string_strict,
             **USB_BLACKLIST_SCHEMA,
+            cv.Optional(CONF_INTERFACE_DESCRIPTION): cv.string_strict,
         }
     )
 
@@ -373,6 +384,16 @@ def _validate_full_speed_only(config: dict) -> dict:
             f"{CONF_FULL_SPEED_ONLY} applies to the high-speed controller, which "
             f"{CONF_CONTROLLERS}: {CONTROLLERS_FULL_SPEED} does not run"
         )
+    return config
+
+
+def _validate_fs_fifo_bias(config: dict) -> dict:
+    if CONF_FS_FIFO_BIAS not in config:
+        return config
+    if not per_port_fifo_bias_available():
+        raise cv.Invalid(f"{CONF_FS_FIFO_BIAS} requires IDF >= 5.4.0")
+    if fs_peripheral_index() is None:
+        raise cv.Invalid(f"{CONF_FS_FIFO_BIAS}: no full-speed controller runs in this configuration")
     return config
 
 
@@ -562,6 +583,10 @@ CONFIG_SCHEMA = cv.All(
             # The high-speed controller as a full/low-speed host: it ignores the
             # high-speed chirp, so every device and hub on it runs at full or low speed.
             cv.Optional(CONF_FULL_SPEED_ONLY): cv.boolean,
+            cv.Optional(CONF_ISOCHRONOUS, default=False): cv.boolean,
+            cv.Optional(CONF_FS_FIFO_BIAS): cv.one_of(
+                FIFO_BIAS_BALANCED, FIFO_BIAS_IN, FIFO_BIAS_PERIODIC_OUT, lower=True
+            ),
             # Devices that enumerate in the wrong mode, switched before they are routed.
             cv.Optional(CONF_MODE_SWITCH): cv.ensure_list(MODE_SWITCH_SCHEMA),
         }
@@ -578,6 +603,7 @@ CONFIG_SCHEMA = cv.All(
     _resolve_controllers,
     _validate_full_speed_only,
     _store_host_options,
+    _validate_fs_fifo_bias,
 )
 
 
@@ -664,6 +690,10 @@ async def register_usb_client(config: ConfigType) -> MockObj:
     if (product := config.get(CONF_PRODUCT)) is not None:
         cg.add(var.set_product_filter(cg.RawExpression(cpp_u16string_escape(product))))
     await setup_usb_match(var, config)
+    if (interface := config.get(CONF_INTERFACE_DESCRIPTION)) is not None:
+        cg.add(
+            var.set_interface_filter(cg.RawExpression(cpp_u16string_escape(interface)))
+        )
     return var
 
 
@@ -684,7 +714,7 @@ async def to_code(config: ConfigType) -> None:
         cg.add_define("USE_USB_HOST_CHANNEL_BUDGET")
         cg.add_define("USE_USB_HOST_SHARED_TASK")
 
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
+    set_idf_sdkconfig_default("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
     if config.get(CONF_ENABLE_HUBS):
         add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
 
@@ -703,6 +733,10 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_fs_phy_index(config[CONF_FS_PINS]))
     if config.get(CONF_FULL_SPEED_ONLY):
         cg.add(var.set_full_speed_only(True))
+    if config[CONF_ISOCHRONOUS]:
+        require_isoc_transfers()
+    if (bias := config.get(CONF_FS_FIFO_BIAS)) is not None:
+        set_port_fifo_bias(fs_peripheral_index(), bias)
 
     for entry in config.get(CONF_MODE_SWITCH) or ():
         vid, pid = entry[CONF_VID], entry[CONF_PID]

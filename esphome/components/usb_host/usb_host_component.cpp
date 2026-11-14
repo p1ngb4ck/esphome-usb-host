@@ -177,6 +177,68 @@ void USBHost::register_client(USBClient *client) {
   this->reroute_ = true;
 }
 
+void USBHost::forget_declined(USBClient *client) {
+  for (auto &dev : this->devices_)
+    std::erase(dev.declined, client);
+  this->reroute_ = true;
+}
+
+bool USBHost::retire_client(USBClient *client) {
+  static constexpr uint32_t RETIRE_WAIT_MS = 500;
+  std::erase(this->clients_, client);
+  bool held = false;
+  for (auto &dev : this->devices_) {
+    if (std::find(dev.bound.begin(), dev.bound.end(), client) == dev.bound.end())
+      continue;
+    held = true;
+    if (client->state_ == USB_CLIENT_OPEN) {
+      client->state_ = USB_CLIENT_INIT;
+      client->device_addr_ = -1;
+      client->routed_interfaces_ = 0;
+      this->client_released(client, dev.addr);
+      return false;
+    }
+    if (!dev.retiring) {
+      dev.retiring = true;
+      dev.taking_ms = millis();
+      dev.leaving.clear();
+      const bool alone = dev.bound.size() == 1;
+      const uint32_t own = client->routed_interfaces_;
+      uint8_t interface = 0;
+      int offset = 0;
+      const auto *next = reinterpret_cast<const usb_standard_desc_t *>(dev.config);
+      while ((next = usb_parse_next_descriptor(next, dev.config->wTotalLength, &offset)) != nullptr) {
+        if (next->bDescriptorType == USB_W_VALUE_DT_INTERFACE) {
+          interface = reinterpret_cast<const usb_intf_desc_t *>(next)->bInterfaceNumber;
+        } else if (next->bDescriptorType == USB_W_VALUE_DT_ENDPOINT &&
+                   (alone || (interface < 32 && (own & (1u << interface)) != 0))) {
+          const uint8_t ep = reinterpret_cast<const usb_ep_desc_t *>(next)->bEndpointAddress;
+          if (usb_host_endpoint_halt(dev.handle, ep) == ESP_OK)
+            usb_host_endpoint_flush(dev.handle, ep);
+        }
+      }
+    }
+    if (std::find(dev.leaving.begin(), dev.leaving.end(), client) != dev.leaving.end())
+      continue;
+    if (client->trq_in_use_.load(std::memory_order_acquire) != 0 && millis() - dev.taking_ms < RETIRE_WAIT_MS)
+      continue;
+    UsbEvent *event = client->event_pool.allocate();
+    if (event == nullptr)
+      continue;
+    event->type = EVENT_DEVICE_GONE;
+    event->data.device_gone.handle = dev.handle;
+    client->event_queue.push(event);
+    client->enable_loop_soon_any_context();
+    dev.leaving.push_back(client);
+  }
+  if (!held) {
+    for (auto &dev : this->devices_)
+      dev.retiring = false;
+    this->reroute_ = true;
+  }
+  return !held;
+}
+
 // Main loop: called from usb_host_client_handle_events() in loop().
 void USBHost::host_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg) {
   auto *host = static_cast<USBHost *>(arg);
@@ -848,11 +910,9 @@ void USBHost::isoc_cb(usb_transfer_t *xfer) {
         // device object leaks for the life of the process.
         usb_device_handle_t device_handle = stream_device_handle_(*stream, client);
         if (device_handle != nullptr) {
-          get_usb_host()->stream_release(*stream, client, client->handle_, device_handle);
+          get_usb_host()->stream_reset_alt(*stream, client);
         }
-        stream->open_state.store(IsocOpenState::CLOSED, std::memory_order_release);
-        client->enable_loop();  // closed: an owner waiting to open it again runs now (main loop)
-        ESP_LOGD(TAG, "stream_close deferred: ep=0x%02X", stream->ep_addr);
+        get_usb_host()->stream_finish_close(*stream, client);
       });
     }
   };
@@ -979,6 +1039,13 @@ void USBHost::stream_release(IsocStream &stream, USBClient *cb, usb_host_client_
                              usb_device_handle_t device_handle) {
   if (!stream.owns_interface)
     return;
+  this->stream_reset_alt(stream, cb);
+  this->do_release_interface(client_handle, device_handle, stream.interface_num);
+}
+
+void USBHost::stream_reset_alt(IsocStream &stream, USBClient *cb) {
+  if (!stream.owns_interface)
+    return;
   // Only the owner may touch the alt-setting: a feedback stream shares its interface with
   // the data stream, and resetting it here would tear that one down.
   if (stream.alt_setting != 0) {
@@ -993,7 +1060,22 @@ void USBHost::stream_release(IsocStream &stream, USBClient *cb, usb_host_client_
       cb->set_interface(stream.interface_num, 0, done);
     }
   }
-  this->do_release_interface(client_handle, device_handle, stream.interface_num);
+}
+
+void USBHost::stream_finish_close(IsocStream &stream, USBClient *client) {
+  usb_device_handle_t device_handle = stream_device_handle_(stream, client);
+  if (stream.owns_interface && device_handle != nullptr) {
+    esp_err_t err = usb_host_interface_release(client->handle_, device_handle, stream.interface_num);
+    if (err == ESP_ERR_INVALID_STATE) {
+      this->defer([this, &stream, client]() { this->stream_finish_close(stream, client); });
+      return;
+    }
+    if (err != ESP_OK)
+      ESP_LOGE(TAG, "release_interface %u failed: %s", stream.interface_num, esp_err_to_name(err));
+  }
+  stream.open_state.store(IsocOpenState::CLOSED, std::memory_order_release);
+  client->enable_loop();
+  ESP_LOGD(TAG, "stream_close deferred: ep=0x%02X", stream.ep_addr);
 }
 
 bool USBHost::stream_open(IsocStream &stream, USBClient *cb, usb_host_client_handle_t client_handle,
