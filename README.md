@@ -69,3 +69,14 @@ core of the build host stays as installed.
 The mode switch methods follow BlueZ's `hid2hci` and Josua Dietze's usb_modeswitch - thank you for documenting
 what all those dongles need. Everyone this project builds on:
 [ATTRIBUTIONS.md](https://github.com/p1ngb4ck/esphome/blob/dev/ATTRIBUTIONS.md).
+
+## Branch structure
+
+Each `pr/` branch holds one part of this topic on top of upstream and says in its `BRANCH.md` what it is based on. `main` holds all of them.
+
+| Branch | Based on |
+|---|---|
+| `pr/tinyusb-port` | `pr/usb-host-dual-host` |
+| `pr/usb-host-dual-host` | `pr/usb-host-refactor` |
+| `pr/usb-host-mode-switch` | `pr/usb-host-refactor` |
+| `pr/usb-host-refactor` | `pr/esp32-idf-component-override-path` of p1ngb4ck/esphome-esp32-platform, `pr/esp32-loop-task-core` of p1ngb4ck/esphome-esp32-platform |
