@@ -269,7 +269,6 @@ struct RoutedDevice {
   // on an unplug) once its transfers are back, and the taker gets it when all have let go.
   bool taking{false};
   uint32_t taking_ms{0};
-  bool retiring{false};
   std::vector<USBClient *> leaving{};
 };
 
@@ -393,7 +392,6 @@ class USBClient : public Component {
   USBClient(uint16_t vid, uint16_t pid) : trq_in_use_(0), vid_(vid), pid_(pid) {}
   void setup() override;
   void loop() override;
-  bool teardown() override;
   float get_setup_priority() const override { return setup_priority::IO; }
   virtual void on_removed(usb_device_handle_t handle);
   void dump_config() override;
@@ -648,7 +646,6 @@ class USBClient : public Component {
   /// Returns false, with no completion to follow, when the interface has no string or the
   /// read could not be started.
   bool read_interface_string_(uint8_t interface_number);
-  bool read_interface_string_(usb_device_handle_t device, uint8_t interface_number);
   /// The string read_interface_string_() asked for, or null when the read failed. It lives
   /// in the transfer buffer only until the next read, so copy what is needed.
   virtual void on_interface_string(uint8_t interface_number, const usb_str_desc_t *desc) {}
@@ -744,11 +741,6 @@ class USBHost final : public Component {
   void loop() override;
   void setup() override;
 
-  // Which ESP32-P4 controllers run as host (controllers option): usb_host_config_t's
-  // peripheral_map, BIT0 high-speed, BIT1 full-speed. Only the patched espressif/usb component
-  // sets up a PHY per controller (IDF's 5.x built-in sets up one), hence the guards at the use
-  // site and in codegen.
-  void set_peripheral_map(uint8_t map) { this->peripheral_map_ = map; }
 #ifdef USE_USB_HOST_CHANNEL_BUDGET
   /// Host channels of a controller (0 high-speed, 1 full-speed): allocated now, committed to the configured devices,
   /// the hardware's total. False while the controller has no port (not in use).
@@ -756,9 +748,6 @@ class USBHost final : public Component {
     return usb_host_channel_usage(controller, &used, &committed, &total) == ESP_OK;
   }
 #endif
-  // Which of the ESP32-P4's two internal FSLS PHYs the full-speed OTG controller uses:
-  // 0 is GPIO24/25, 1 is GPIO26/27 (the reset default). Set from the fs_pins option.
-  void set_fs_phy_index(uint8_t index) { this->fs_phy_index_ = index; }
 #ifdef USE_USB_HOST_PER_PORT_FIFO_BIAS
   // How one host controller divides its hardware FIFO between received data, non-periodic
   // OUT and periodic OUT. The division caps the largest packet each direction can carry, so
@@ -770,8 +759,6 @@ class USBHost final : public Component {
     if (peripheral_index < SOC_USB_OTG_PERIPH_NUM)
       this->port_fifo_bias_[peripheral_index] = bias;
   }
-  // The high-speed controller as a full/low-speed host (full_speed_only option).
-  void set_full_speed_only(bool full_speed_only) { this->full_speed_only_ = full_speed_only; }
 #endif
 
   // -- Submission engine (called by USBClient thin forwarders) ----------------
@@ -812,8 +799,6 @@ class USBHost final : public Component {
   // nothing to reset.
   void stream_release(IsocStream &stream, USBClient *cb, usb_host_client_handle_t client_handle,
                       usb_device_handle_t device_handle);
-  void stream_reset_alt(IsocStream &stream, USBClient *cb);
-  void stream_finish_close(IsocStream &stream, USBClient *client);
 
   // Static trampoline stored as xfer->callback for every ISOC URB.
   // Iterates isoc_packet_desc[], calls client->on_isoc_packet() per packet, resubmits.
@@ -824,8 +809,6 @@ class USBHost final : public Component {
   // Every driver registers in its setup(). USBHost opens each new device once, reads its
   // descriptors and hands it, interface by interface, to the drivers that match it.
   void register_client(USBClient *client);
-  bool retire_client(USBClient *client);
-  void forget_declined(USBClient *client);
 #ifdef USE_USB_HOST_SHARED_TASK
   bool attach_client(USBClient *client);
   void release_client(USBClient *client);
@@ -890,11 +873,8 @@ class USBHost final : public Component {
   std::vector<RoutedDevice> devices_{};
   LazyCallbackManager<void()> devices_callback_;
   bool reroute_{false};
-  uint8_t peripheral_map_{0};  // 0: ESP-IDF's default, the high-speed controller
-  uint8_t fs_phy_index_{1};
 #ifdef USE_USB_HOST_PER_PORT_FIFO_BIAS
   uint8_t port_fifo_bias_[SOC_USB_OTG_PERIPH_NUM]{};
-  bool full_speed_only_{false};
 #endif
 };
 

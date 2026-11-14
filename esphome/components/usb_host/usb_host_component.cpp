@@ -32,32 +32,7 @@ USBHost *get_usb_host() { return usb_host_ref(); }
 
 void USBHost::setup() {
   this->load_mode_switch_state_();
-#if defined(USE_ESP32_VARIANT_ESP32P4)
-  // The full-speed OTG controller shares two internal FSLS PHYs with USB-Serial-JTAG. Out of
-  // reset the controller gets PHY 1 (GPIO26/27) and USB-Serial-JTAG gets PHY 0 (GPIO24/25).
-  // A board that wires its full-speed connector to GPIO24/25 needs the other mapping, which
-  // is a software register in LP_SYS -- no eFuse required. usb_phy.c does not touch this
-  // selector, so it has to happen here, before usb_host_install() brings the PHY up.
-  if (this->fs_phy_index_ == 0) {
-    usb_wrap_ll_phy_select(nullptr, 0);
-    // usb_phy.c raises the pad drive strength on GPIO26/27 unconditionally, because that is
-    // what soc's internal_phy_io names. After the swap the controller drives the other pair,
-    // so raise it there too rather than relying on the fixed constant.
-    gpio_set_drive_capability(GPIO_NUM_24, GPIO_DRIVE_CAP_3);
-    gpio_set_drive_capability(GPIO_NUM_25, GPIO_DRIVE_CAP_3);
-    ESP_LOGI(TAG, "USB FS PHY 0 selected (D- GPIO24, D+ GPIO25)");
-  }
-#endif
   usb_host_config_t config{};
-#if defined(USE_ESP32_VARIANT_ESP32P4) && defined(USE_USB_HOST_PER_PORT_FIFO_BIAS)
-  if (this->peripheral_map_ != 0) {
-    // Bit 0 is the high-speed controller, bit 1 the full-speed one.
-    config.peripheral_map = this->peripheral_map_;
-    ESP_LOGI(TAG, "USB host on %s", this->peripheral_map_ == 0b11  ? "both controllers"
-                                    : this->peripheral_map_ == 0b10 ? "the full-speed controller"
-                                                                     : "the high-speed controller");
-  }
-#endif
 #ifdef USE_USB_HOST_PER_PORT_FIFO_BIAS
   // Each controller resolves its own split from its own FIFO depth, so setting one here
   // leaves the other on ESP-IDF's Kconfig default rather than moving it too.
@@ -67,9 +42,6 @@ void USBHost::setup() {
       ESP_LOGI(TAG, "USB controller %u FIFO bias %u", i, this->port_fifo_bias_[i]);
     }
   }
-  config.fsls_only = this->full_speed_only_;
-  if (this->full_speed_only_)
-    ESP_LOGI(TAG, "High-speed controller limited to full/low speed");
 #endif
 #ifdef USE_USB_HOST_CHANNEL_BUDGET
   // Every device's host channels are counted before it is configured (channel_budget_cb)
@@ -175,68 +147,6 @@ void USBHost::register_client(USBClient *client) {
   this->clients_.push_back(client);
   // A device that came up before this driver did is offered to it now.
   this->reroute_ = true;
-}
-
-void USBHost::forget_declined(USBClient *client) {
-  for (auto &dev : this->devices_)
-    std::erase(dev.declined, client);
-  this->reroute_ = true;
-}
-
-bool USBHost::retire_client(USBClient *client) {
-  static constexpr uint32_t RETIRE_WAIT_MS = 500;
-  std::erase(this->clients_, client);
-  bool held = false;
-  for (auto &dev : this->devices_) {
-    if (std::find(dev.bound.begin(), dev.bound.end(), client) == dev.bound.end())
-      continue;
-    held = true;
-    if (client->state_ == USB_CLIENT_OPEN) {
-      client->state_ = USB_CLIENT_INIT;
-      client->device_addr_ = -1;
-      client->routed_interfaces_ = 0;
-      this->client_released(client, dev.addr);
-      return false;
-    }
-    if (!dev.retiring) {
-      dev.retiring = true;
-      dev.taking_ms = millis();
-      dev.leaving.clear();
-      const bool alone = dev.bound.size() == 1;
-      const uint32_t own = client->routed_interfaces_;
-      uint8_t interface = 0;
-      int offset = 0;
-      const auto *next = reinterpret_cast<const usb_standard_desc_t *>(dev.config);
-      while ((next = usb_parse_next_descriptor(next, dev.config->wTotalLength, &offset)) != nullptr) {
-        if (next->bDescriptorType == USB_W_VALUE_DT_INTERFACE) {
-          interface = reinterpret_cast<const usb_intf_desc_t *>(next)->bInterfaceNumber;
-        } else if (next->bDescriptorType == USB_W_VALUE_DT_ENDPOINT &&
-                   (alone || (interface < 32 && (own & (1u << interface)) != 0))) {
-          const uint8_t ep = reinterpret_cast<const usb_ep_desc_t *>(next)->bEndpointAddress;
-          if (usb_host_endpoint_halt(dev.handle, ep) == ESP_OK)
-            usb_host_endpoint_flush(dev.handle, ep);
-        }
-      }
-    }
-    if (std::find(dev.leaving.begin(), dev.leaving.end(), client) != dev.leaving.end())
-      continue;
-    if (client->trq_in_use_.load(std::memory_order_acquire) != 0 && millis() - dev.taking_ms < RETIRE_WAIT_MS)
-      continue;
-    UsbEvent *event = client->event_pool.allocate();
-    if (event == nullptr)
-      continue;
-    event->type = EVENT_DEVICE_GONE;
-    event->data.device_gone.handle = dev.handle;
-    client->event_queue.push(event);
-    client->enable_loop_soon_any_context();
-    dev.leaving.push_back(client);
-  }
-  if (!held) {
-    for (auto &dev : this->devices_)
-      dev.retiring = false;
-    this->reroute_ = true;
-  }
-  return !held;
 }
 
 // Main loop: called from usb_host_client_handle_events() in loop().
@@ -910,9 +820,11 @@ void USBHost::isoc_cb(usb_transfer_t *xfer) {
         // device object leaks for the life of the process.
         usb_device_handle_t device_handle = stream_device_handle_(*stream, client);
         if (device_handle != nullptr) {
-          get_usb_host()->stream_reset_alt(*stream, client);
+          get_usb_host()->stream_release(*stream, client, client->handle_, device_handle);
         }
-        get_usb_host()->stream_finish_close(*stream, client);
+        stream->open_state.store(IsocOpenState::CLOSED, std::memory_order_release);
+        client->enable_loop();  // closed: an owner waiting to open it again runs now (main loop)
+        ESP_LOGD(TAG, "stream_close deferred: ep=0x%02X", stream->ep_addr);
       });
     }
   };
@@ -1039,13 +951,6 @@ void USBHost::stream_release(IsocStream &stream, USBClient *cb, usb_host_client_
                              usb_device_handle_t device_handle) {
   if (!stream.owns_interface)
     return;
-  this->stream_reset_alt(stream, cb);
-  this->do_release_interface(client_handle, device_handle, stream.interface_num);
-}
-
-void USBHost::stream_reset_alt(IsocStream &stream, USBClient *cb) {
-  if (!stream.owns_interface)
-    return;
   // Only the owner may touch the alt-setting: a feedback stream shares its interface with
   // the data stream, and resetting it here would tear that one down.
   if (stream.alt_setting != 0) {
@@ -1060,22 +965,7 @@ void USBHost::stream_reset_alt(IsocStream &stream, USBClient *cb) {
       cb->set_interface(stream.interface_num, 0, done);
     }
   }
-}
-
-void USBHost::stream_finish_close(IsocStream &stream, USBClient *client) {
-  usb_device_handle_t device_handle = stream_device_handle_(stream, client);
-  if (stream.owns_interface && device_handle != nullptr) {
-    esp_err_t err = usb_host_interface_release(client->handle_, device_handle, stream.interface_num);
-    if (err == ESP_ERR_INVALID_STATE) {
-      this->defer([this, &stream, client]() { this->stream_finish_close(stream, client); });
-      return;
-    }
-    if (err != ESP_OK)
-      ESP_LOGE(TAG, "release_interface %u failed: %s", stream.interface_num, esp_err_to_name(err));
-  }
-  stream.open_state.store(IsocOpenState::CLOSED, std::memory_order_release);
-  client->enable_loop();
-  ESP_LOGD(TAG, "stream_close deferred: ep=0x%02X", stream.ep_addr);
+  this->do_release_interface(client_handle, device_handle, stream.interface_num);
 }
 
 bool USBHost::stream_open(IsocStream &stream, USBClient *cb, usb_host_client_handle_t client_handle,
