@@ -16,9 +16,10 @@ from esphome.components.esp32 import (
     get_esp32_variant,
     idf_version,
     only_on_variant,
+    set_idf_sdkconfig_default,
 )
 import esphome.config_validation as cv
-from esphome.const import CONF_DEVICES, CONF_ID
+from esphome.const import CONF_DATA, CONF_DEVICES, CONF_ID, CONF_VALUE
 from esphome.core import CORE, ID
 from esphome.coroutine import CoroPriority, coroutine_with_priority
 from esphome.cpp_generator import MockObj
@@ -39,6 +40,7 @@ DOMAIN = "usb_host"
 CONF_VID = "vid"
 CONF_PID = "pid"
 CONF_PRODUCT = "product"
+CONF_INTERFACE_DESCRIPTION = "interface_description"
 CONF_ENABLE_HUBS = "enable_hubs"
 CONF_MAX_TRANSFER_REQUESTS = "max_transfer_requests"
 CONF_MAX_PACKET_SIZE = "max_packet_size"
@@ -56,6 +58,33 @@ _PERIPHERAL_MAPS = {
 }
 CONF_FS_PINS = "fs_pins"
 CONF_FULL_SPEED_ONLY = "full_speed_only"
+CONF_ISOCHRONOUS = "isochronous"
+CONF_FS_FIFO_BIAS = "full_speed_fifo_bias"
+CONF_MODE_SWITCH = "mode_switch"
+CONF_HID2HCI = "hid2hci"
+CONF_BULK_MESSAGES = "bulk_messages"
+CONF_NEED_RESPONSE = "need_response"
+CONF_CONTROL = "control"
+CONF_REQUEST_TYPE = "request_type"
+CONF_REQUEST = "request"
+CONF_INDEX = "index"
+
+# BlueZ tools/hid2hci.c: the request each method sends to switch a dongle from HID proxy mode
+# to HCI, as (bmRequestType, bRequest, wValue, wIndex, data).
+HID2HCI_METHODS = {
+    # usb_switch_dell(): HID SET_REPORT, feature report 0x7f, on interface 0.
+    "dell": (0x21, 0x09, 0x037F, 0, [0x7F, 0x13, 0x00, 0x00]),
+    # usb_switch_csr(): vendor request 0 with wValue 0 (HCI).
+    "csr": (0x40, 0x00, 0x0000, 0, []),
+    # usb_switch_csr2(): HID SET_REPORT, feature report 0x01, on interface 0.
+    "csr2": (
+        0x21,
+        0x09,
+        0x0301,
+        0,
+        [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ),
+}
 
 # GPIO pair the ESP32-P4 full-speed OTG controller is wired to on the board. The chip has
 # two internal FSLS PHYs: PHY 0 on GPIO24 (D-) / GPIO25 (D+), PHY 1 on GPIO26 / GPIO27.
@@ -76,12 +105,13 @@ _TRANSFER_DEFINES = {
 }
 
 
-# VID/PID set to 0 or `None` product/manufacturer are wildcards
+# VID/PID set to 0 or `None` strings are wildcards
 _FILTER_WILDCARDS = {
     CONF_VID: 0,
     CONF_PID: 0,
     CONF_MANUFACTURER: None,
     CONF_PRODUCT: None,
+    CONF_INTERFACE_DESCRIPTION: None,
 }
 
 
@@ -166,11 +196,16 @@ def note_usb_whitelist_used() -> None:
 @coroutine_with_priority(CoroPriority.FINAL)
 async def _usb_match_guards() -> None:
     data = CORE.data.get(DOMAIN, {})
-    cg.add_define("USB_HOST_WHITELIST", 1 if data.get(KEY_WHITELIST_USED) else 0)
-    cg.add_define("USB_HOST_BLACKLIST", 1 if data.get(KEY_BLACKLIST_USED) else 0)
+    packaged = "package_manager" in CORE.config
+    cg.add_define(
+        "USB_HOST_WHITELIST", 1 if packaged or data.get(KEY_WHITELIST_USED) else 0
+    )
+    cg.add_define(
+        "USB_HOST_BLACKLIST", 1 if packaged or data.get(KEY_BLACKLIST_USED) else 0
+    )
     cg.add_define(
         "USB_HOST_INTERFACE_BLACKLIST",
-        1 if data.get(KEY_INTERFACE_BLACKLIST_USED) else 0,
+        1 if packaged or data.get(KEY_INTERFACE_BLACKLIST_USED) else 0,
     )
 
 
@@ -198,8 +233,48 @@ def usb_device_schema(
             cv.Optional(CONF_MANUFACTURER): cv.string_strict,
             cv.Optional(CONF_PRODUCT): cv.string_strict,
             **USB_BLACKLIST_SCHEMA,
+            cv.Optional(CONF_INTERFACE_DESCRIPTION): cv.string_strict,
         }
     )
+
+
+def _hex_message(value) -> list[int]:
+    """A usb_modeswitch MessageContent: hex digits, two per byte."""
+    value = cv.string_strict(value).replace(" ", "")
+    if not value or len(value) % 2:
+        raise cv.Invalid("a message is an even number of hex digits")
+    try:
+        return list(bytes.fromhex(value))
+    except ValueError as err:
+        raise cv.Invalid(f"not a hex string: {value}") from err
+
+
+MODE_SWITCH_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.Required(CONF_VID): cv.hex_uint16_t,
+            cv.Required(CONF_PID): cv.hex_uint16_t,
+            # Bluetooth dongles in HID proxy mode, by BlueZ hid2hci's methods.
+            cv.Optional(CONF_HID2HCI): cv.one_of(*HID2HCI_METHODS, lower=True),
+            # usb_modeswitch style: up to three messages to the first bulk OUT endpoint.
+            cv.Optional(CONF_BULK_MESSAGES): cv.All(
+                cv.ensure_list(_hex_message), cv.Length(min=1, max=3)
+            ),
+            cv.Optional(CONF_NEED_RESPONSE, default=False): cv.boolean,
+            # Any control request.
+            cv.Optional(CONF_CONTROL): cv.Schema(
+                {
+                    cv.Required(CONF_REQUEST_TYPE): cv.hex_uint8_t,
+                    cv.Required(CONF_REQUEST): cv.hex_uint8_t,
+                    cv.Optional(CONF_VALUE, default=0): cv.hex_uint16_t,
+                    cv.Optional(CONF_INDEX, default=0): cv.hex_uint16_t,
+                    cv.Optional(CONF_DATA, default=[]): cv.ensure_list(cv.hex_uint8_t),
+                }
+            ),
+        }
+    ),
+    cv.has_exactly_one_key(CONF_HID2HCI, CONF_BULK_MESSAGES, CONF_CONTROL),
+)
 
 
 def _matches_by_class_only(config: ConfigType) -> bool:
@@ -309,6 +384,16 @@ def _validate_full_speed_only(config: dict) -> dict:
             f"{CONF_FULL_SPEED_ONLY} applies to the high-speed controller, which "
             f"{CONF_CONTROLLERS}: {CONTROLLERS_FULL_SPEED} does not run"
         )
+    return config
+
+
+def _validate_fs_fifo_bias(config: dict) -> dict:
+    if CONF_FS_FIFO_BIAS not in config:
+        return config
+    if not per_port_fifo_bias_available():
+        raise cv.Invalid(f"{CONF_FS_FIFO_BIAS} requires IDF >= 5.4.0")
+    if fs_peripheral_index() is None:
+        raise cv.Invalid(f"{CONF_FS_FIFO_BIAS}: no full-speed controller runs in this configuration")
     return config
 
 
@@ -498,6 +583,12 @@ CONFIG_SCHEMA = cv.All(
             # The high-speed controller as a full/low-speed host: it ignores the
             # high-speed chirp, so every device and hub on it runs at full or low speed.
             cv.Optional(CONF_FULL_SPEED_ONLY): cv.boolean,
+            cv.Optional(CONF_ISOCHRONOUS, default=False): cv.boolean,
+            cv.Optional(CONF_FS_FIFO_BIAS): cv.one_of(
+                FIFO_BIAS_BALANCED, FIFO_BIAS_IN, FIFO_BIAS_PERIODIC_OUT, lower=True
+            ),
+            # Devices that enumerate in the wrong mode, switched before they are routed.
+            cv.Optional(CONF_MODE_SWITCH): cv.ensure_list(MODE_SWITCH_SCHEMA),
         }
     ),
     only_on_variant(
@@ -512,6 +603,7 @@ CONFIG_SCHEMA = cv.All(
     _resolve_controllers,
     _validate_full_speed_only,
     _store_host_options,
+    _validate_fs_fifo_bias,
 )
 
 
@@ -598,6 +690,10 @@ async def register_usb_client(config: ConfigType) -> MockObj:
     if (product := config.get(CONF_PRODUCT)) is not None:
         cg.add(var.set_product_filter(cg.RawExpression(cpp_u16string_escape(product))))
     await setup_usb_match(var, config)
+    if (interface := config.get(CONF_INTERFACE_DESCRIPTION)) is not None:
+        cg.add(
+            var.set_interface_filter(cg.RawExpression(cpp_u16string_escape(interface)))
+        )
     return var
 
 
@@ -618,7 +714,7 @@ async def to_code(config: ConfigType) -> None:
         cg.add_define("USE_USB_HOST_CHANNEL_BUDGET")
         cg.add_define("USE_USB_HOST_SHARED_TASK")
 
-    add_idf_sdkconfig_option("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
+    set_idf_sdkconfig_default("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
     if config.get(CONF_ENABLE_HUBS):
         add_idf_sdkconfig_option("CONFIG_USB_HOST_HUBS_SUPPORTED", True)
 
@@ -637,6 +733,37 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_fs_phy_index(config[CONF_FS_PINS]))
     if config.get(CONF_FULL_SPEED_ONLY):
         cg.add(var.set_full_speed_only(True))
+    if config[CONF_ISOCHRONOUS]:
+        require_isoc_transfers()
+    if (bias := config.get(CONF_FS_FIFO_BIAS)) is not None:
+        set_port_fifo_bias(fs_peripheral_index(), bias)
+
+    for entry in config.get(CONF_MODE_SWITCH) or ():
+        vid, pid = entry[CONF_VID], entry[CONF_PID]
+        if CONF_BULK_MESSAGES in entry:
+            cg.add(
+                var.add_mode_switch_bulk(
+                    vid, pid, entry[CONF_BULK_MESSAGES], entry[CONF_NEED_RESPONSE]
+                )
+            )
+            continue
+        if CONF_HID2HCI in entry:
+            request_type, request, value, index, data = HID2HCI_METHODS[
+                entry[CONF_HID2HCI]
+            ]
+        else:
+            control = entry[CONF_CONTROL]
+            request_type, request = control[CONF_REQUEST_TYPE], control[CONF_REQUEST]
+            value, index, data = (
+                control[CONF_VALUE],
+                control[CONF_INDEX],
+                control[CONF_DATA],
+            )
+        cg.add(
+            var.add_mode_switch_control(
+                vid, pid, request_type, request, value, index, data
+            )
+        )
 
     # FINAL: require_*() calls arrive from consumer to_code() at higher priorities, so
     # turn the collected set into defines once after every job ran. Emitting per call
