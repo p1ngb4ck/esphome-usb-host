@@ -18,6 +18,14 @@
 
 namespace esphome::usb_host {
 
+#ifndef LOOP_TASK_CORE
+#if CONFIG_FREERTOS_UNICORE
+static constexpr BaseType_t LOOP_TASK_CORE = tskNO_AFFINITY;
+#else
+static constexpr BaseType_t LOOP_TASK_CORE = 1;
+#endif
+#endif
+
 #pragma GCC diagnostic ignored "-Wparentheses"
 
 using namespace bytebuffer;
