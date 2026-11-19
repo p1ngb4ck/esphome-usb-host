@@ -548,16 +548,16 @@ async def to_code(config: ConfigType) -> None:
                 ref=idf_usb_patch_mod.USB_COMPONENT_VERSION,
                 override_path=_sync_usb_component_override(),
             )
+            cg.add_define("USE_USB_HOST_PER_PORT_FIFO_BIAS")
+            # The patched copy also counts every device's host channels before it is configured and claims
+            # interfaces without the endpoints their driver never uses (idf_usb_patch.py)
+            cg.add_define("USE_USB_HOST_CHANNEL_BUDGET")
+            cg.add_define("USE_USB_HOST_SHARED_TASK")
         except TypeError:
             add_idf_component(
                 name="espressif/usb",
                 ref=idf_usb_patch_mod.USB_COMPONENT_VERSION,
             )
-        cg.add_define("USE_USB_HOST_PER_PORT_FIFO_BIAS")
-        # The patched copy also counts every device's host channels before it is configured and claims
-        # interfaces without the endpoints their driver never uses (idf_usb_patch.py)
-        cg.add_define("USE_USB_HOST_CHANNEL_BUDGET")
-        cg.add_define("USE_USB_HOST_SHARED_TASK")
 
     set_idf_sdkconfig_default("CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE", 1024)
     if config.get(CONF_ENABLE_HUBS):
