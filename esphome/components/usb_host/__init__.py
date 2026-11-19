@@ -542,11 +542,17 @@ async def to_code(config: ConfigType) -> None:
     if per_port_fifo_bias_available():
         from . import idf_usb_patch as idf_usb_patch_mod
 
-        add_idf_component(
-            name="espressif/usb",
-            ref=idf_usb_patch_mod.USB_COMPONENT_VERSION,
-            override_path=_sync_usb_component_override(),
-        )
+        try:
+            add_idf_component(
+                name="espressif/usb",
+                ref=idf_usb_patch_mod.USB_COMPONENT_VERSION,
+                override_path=_sync_usb_component_override(),
+            )
+        except TypeError:
+            add_idf_component(
+                name="espressif/usb",
+                ref=idf_usb_patch_mod.USB_COMPONENT_VERSION,
+            )
         cg.add_define("USE_USB_HOST_PER_PORT_FIFO_BIAS")
         # The patched copy also counts every device's host channels before it is configured and claims
         # interfaces without the endpoints their driver never uses (idf_usb_patch.py)
