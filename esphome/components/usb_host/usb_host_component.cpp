@@ -14,6 +14,14 @@
 
 namespace esphome::usb_host {
 
+#ifndef LOOP_TASK_CORE
+#if CONFIG_FREERTOS_UNICORE
+static constexpr BaseType_t LOOP_TASK_CORE = tskNO_AFFINITY;
+#else
+static constexpr BaseType_t LOOP_TASK_CORE = 1;
+#endif
+#endif
+
 // Routing client events; a hub brings up several devices at once.
 static constexpr int HOST_EVENT_QUEUE_SIZE = 16;
 // After a mode switch the device is left alone this long, to re-enumerate in its new mode.
